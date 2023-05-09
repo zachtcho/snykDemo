@@ -1,264 +1,375 @@
-import codecs
+import base64
 import datetime
-import locale
-from decimal import Decimal
-from types import NoneType
-from urllib.parse import quote
+import re
+import unicodedata
+from binascii import Error as BinasciiError
+from email.utils import formatdate
+from urllib.parse import quote, unquote
+from urllib.parse import urlencode as original_urlencode
+from urllib.parse import urlparse
 
-from django.utils.functional import Promise
+from django.utils.datastructures import MultiValueDict
+from django.utils.regex_helper import _lazy_re_compile
 
-
-class DjangoUnicodeDecodeError(UnicodeDecodeError):
-    def __init__(self, obj, *args):
-        self.obj = obj
-        super().__init__(*args)
-
-    def __str__(self):
-        return "%s. You passed in %r (%s)" % (
-            super().__str__(),
-            self.obj,
-            type(self.obj),
-        )
-
-
-def smart_str(s, encoding="utf-8", strings_only=False, errors="strict"):
-    """
-    Return a string representing 's'. Treat bytestrings using the 'encoding'
-    codec.
-
-    If strings_only is True, don't convert (some) non-string-like objects.
-    """
-    if isinstance(s, Promise):
-        # The input is the result of a gettext_lazy() call.
-        return s
-    return force_str(s, encoding, strings_only, errors)
-
-
-_PROTECTED_TYPES = (
-    NoneType,
-    int,
-    float,
-    Decimal,
-    datetime.datetime,
-    datetime.date,
-    datetime.time,
+# Based on RFC 9110 Appendix A.
+ETAG_MATCH = _lazy_re_compile(
+    r"""
+    \A(      # start of string and capture group
+    (?:W/)?  # optional weak indicator
+    "        # opening quote
+    [^"]*    # any sequence of non-quote characters
+    "        # end quote
+    )\Z      # end of string and capture group
+""",
+    re.X,
 )
 
+MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+__D = r"(?P<day>[0-9]{2})"
+__D2 = r"(?P<day>[ 0-9][0-9])"
+__M = r"(?P<mon>\w{3})"
+__Y = r"(?P<year>[0-9]{4})"
+__Y2 = r"(?P<year>[0-9]{2})"
+__T = r"(?P<hour>[0-9]{2}):(?P<min>[0-9]{2}):(?P<sec>[0-9]{2})"
+RFC1123_DATE = _lazy_re_compile(r"^\w{3}, %s %s %s %s GMT$" % (__D, __M, __Y, __T))
+RFC850_DATE = _lazy_re_compile(r"^\w{6,9}, %s-%s-%s %s GMT$" % (__D, __M, __Y2, __T))
+ASCTIME_DATE = _lazy_re_compile(r"^\w{3} %s %s %s %s$" % (__M, __D2, __T, __Y))
 
-def is_protected_type(obj):
-    """Determine if the object instance is of a protected type.
+RFC3986_GENDELIMS = ":/?#[]@"
+RFC3986_SUBDELIMS = "!$&'()*+,;="
 
-    Objects of protected types are preserved as-is when passed to
-    force_str(strings_only=True).
+
+def urlencode(query, doseq=False):
     """
-    return isinstance(obj, _PROTECTED_TYPES)
-
-
-def force_str(s, encoding="utf-8", strings_only=False, errors="strict"):
+    A version of Python's urllib.parse.urlencode() function that can operate on
+    MultiValueDict and non-string values.
     """
-    Similar to smart_str(), except that lazy instances are resolved to
-    strings, rather than kept as lazy objects.
-
-    If strings_only is True, don't convert (some) non-string-like objects.
-    """
-    # Handle the common case first for performance reasons.
-    if issubclass(type(s), str):
-        return s
-    if strings_only and is_protected_type(s):
-        return s
-    try:
-        if isinstance(s, bytes):
-            s = str(s, encoding, errors)
+    if isinstance(query, MultiValueDict):
+        query = query.lists()
+    elif hasattr(query, "items"):
+        query = query.items()
+    query_params = []
+    for key, value in query:
+        if value is None:
+            raise TypeError(
+                "Cannot encode None for key '%s' in a query string. Did you "
+                "mean to pass an empty string or omit the value?" % key
+            )
+        elif not doseq or isinstance(value, (str, bytes)):
+            query_val = value
         else:
-            s = str(s)
-    except UnicodeDecodeError as e:
-        raise DjangoUnicodeDecodeError(s, *e.args)
-    return s
-
-
-def smart_bytes(s, encoding="utf-8", strings_only=False, errors="strict"):
-    """
-    Return a bytestring version of 's', encoded as specified in 'encoding'.
-
-    If strings_only is True, don't convert (some) non-string-like objects.
-    """
-    if isinstance(s, Promise):
-        # The input is the result of a gettext_lazy() call.
-        return s
-    return force_bytes(s, encoding, strings_only, errors)
-
-
-def force_bytes(s, encoding="utf-8", strings_only=False, errors="strict"):
-    """
-    Similar to smart_bytes, except that lazy instances are resolved to
-    strings, rather than kept as lazy objects.
-
-    If strings_only is True, don't convert (some) non-string-like objects.
-    """
-    # Handle the common case first for performance reasons.
-    if isinstance(s, bytes):
-        if encoding == "utf-8":
-            return s
-        else:
-            return s.decode("utf-8", errors).encode(encoding, errors)
-    if strings_only and is_protected_type(s):
-        return s
-    if isinstance(s, memoryview):
-        return bytes(s)
-    return str(s).encode(encoding, errors)
-
-
-def iri_to_uri(iri):
-    """
-    Convert an Internationalized Resource Identifier (IRI) portion to a URI
-    portion that is suitable for inclusion in a URL.
-
-    This is the algorithm from RFC 3987 Section 3.1, slightly simplified since
-    the input is assumed to be a string rather than an arbitrary byte stream.
-
-    Take an IRI (string or UTF-8 bytes, e.g. '/I ♥ Django/' or
-    b'/I \xe2\x99\xa5 Django/') and return a string containing the encoded
-    result with ASCII chars only (e.g. '/I%20%E2%99%A5%20Django/').
-    """
-    # The list of safe characters here is constructed from the "reserved" and
-    # "unreserved" characters specified in RFC 3986 Sections 2.2 and 2.3:
-    #     reserved    = gen-delims / sub-delims
-    #     gen-delims  = ":" / "/" / "?" / "#" / "[" / "]" / "@"
-    #     sub-delims  = "!" / "$" / "&" / "'" / "(" / ")"
-    #                   / "*" / "+" / "," / ";" / "="
-    #     unreserved  = ALPHA / DIGIT / "-" / "." / "_" / "~"
-    # Of the unreserved characters, urllib.parse.quote() already considers all
-    # but the ~ safe.
-    # The % character is also added to the list of safe characters here, as the
-    # end of RFC 3987 Section 3.1 specifically mentions that % must not be
-    # converted.
-    if iri is None:
-        return iri
-    elif isinstance(iri, Promise):
-        iri = str(iri)
-    return quote(iri, safe="/#%[]=:;$&()+,!?*@'~")
-
-
-# List of byte values that uri_to_iri() decodes from percent encoding.
-# First, the unreserved characters from RFC 3986:
-_ascii_ranges = [[45, 46, 95, 126], range(65, 91), range(97, 123)]
-_hextobyte = {
-    (fmt % char).encode(): bytes((char,))
-    for ascii_range in _ascii_ranges
-    for char in ascii_range
-    for fmt in ["%02x", "%02X"]
-}
-# And then everything above 128, because bytes ≥ 128 are part of multibyte
-# Unicode characters.
-_hexdig = "0123456789ABCDEFabcdef"
-_hextobyte.update(
-    {(a + b).encode(): bytes.fromhex(a + b) for a in _hexdig[8:] for b in _hexdig}
-)
-
-
-def uri_to_iri(uri):
-    """
-    Convert a Uniform Resource Identifier(URI) into an Internationalized
-    Resource Identifier(IRI).
-
-    This is the algorithm from RFC 3987 Section 3.2, excluding step 4.
-
-    Take an URI in ASCII bytes (e.g. '/I%20%E2%99%A5%20Django/') and return
-    a string containing the encoded result (e.g. '/I%20♥%20Django/').
-    """
-    if uri is None:
-        return uri
-    uri = force_bytes(uri)
-    # Fast selective unquote: First, split on '%' and then starting with the
-    # second block, decode the first 2 bytes if they represent a hex code to
-    # decode. The rest of the block is the part after '%AB', not containing
-    # any '%'. Add that to the output without further processing.
-    bits = uri.split(b"%")
-    if len(bits) == 1:
-        iri = uri
-    else:
-        parts = [bits[0]]
-        append = parts.append
-        hextobyte = _hextobyte
-        for item in bits[1:]:
-            hex = item[:2]
-            if hex in hextobyte:
-                append(hextobyte[item[:2]])
-                append(item[2:])
+            try:
+                itr = iter(value)
+            except TypeError:
+                query_val = value
             else:
-                append(b"%")
-                append(item)
-        iri = b"".join(parts)
-    return repercent_broken_unicode(iri).decode()
+                # Consume generators and iterators, when doseq=True, to
+                # work around https://bugs.python.org/issue31706.
+                query_val = []
+                for item in itr:
+                    if item is None:
+                        raise TypeError(
+                            "Cannot encode None for key '%s' in a query "
+                            "string. Did you mean to pass an empty string or "
+                            "omit the value?" % key
+                        )
+                    elif not isinstance(item, bytes):
+                        item = str(item)
+                    query_val.append(item)
+        query_params.append((key, query_val))
+    return original_urlencode(query_params, doseq)
 
 
-def escape_uri_path(path):
+def http_date(epoch_seconds=None):
     """
-    Escape the unsafe characters from the path portion of a Uniform Resource
-    Identifier (URI).
+    Format the time to match the RFC 5322 date format as specified by RFC 9110
+    Section 5.6.7.
+
+    `epoch_seconds` is a floating point number expressed in seconds since the
+    epoch, in UTC - such as that outputted by time.time(). If set to None, it
+    defaults to the current time.
+
+    Output a string in the format 'Wdy, DD Mon YYYY HH:MM:SS GMT'.
     """
-    # These are the "reserved" and "unreserved" characters specified in RFC
-    # 3986 Sections 2.2 and 2.3:
-    #   reserved    = ";" | "/" | "?" | ":" | "@" | "&" | "=" | "+" | "$" | ","
-    #   unreserved  = alphanum | mark
-    #   mark        = "-" | "_" | "." | "!" | "~" | "*" | "'" | "(" | ")"
-    # The list of safe characters here is constructed subtracting ";", "=",
-    # and "?" according to RFC 3986 Section 3.3.
-    # The reason for not subtracting and escaping "/" is that we are escaping
-    # the entire path, not a path segment.
-    return quote(path, safe="/:@&+$,-_.!~*'()")
+    return formatdate(epoch_seconds, usegmt=True)
 
 
-def punycode(domain):
-    """Return the Punycode of the given domain if it's non-ASCII."""
-    return domain.encode("idna").decode("ascii")
-
-
-def repercent_broken_unicode(path):
+def parse_http_date(date):
     """
-    As per RFC 3987 Section 3.2, step three of converting a URI into an IRI,
-    repercent-encode any octet produced that is not part of a strictly legal
-    UTF-8 octet sequence.
+    Parse a date format as specified by HTTP RFC 9110 Section 5.6.7.
+
+    The three formats allowed by the RFC are accepted, even if only the first
+    one is still in widespread use.
+
+    Return an integer expressed in seconds since the epoch, in UTC.
     """
-    while True:
-        try:
-            path.decode()
-        except UnicodeDecodeError as e:
-            # CVE-2019-14235: A recursion shouldn't be used since the exception
-            # handling uses massive amounts of memory
-            repercent = quote(path[e.start : e.end], safe=b"/#%[]=:;$&()+,!?*@'~")
-            path = path[: e.start] + repercent.encode() + path[e.end :]
-        else:
-            return path
+    # email.utils.parsedate() does the job for RFC 1123 dates; unfortunately
+    # RFC 9110 makes it mandatory to support RFC 850 dates too. So we roll
+    # our own RFC-compliant parsing.
+    for regex in RFC1123_DATE, RFC850_DATE, ASCTIME_DATE:
+        m = regex.match(date)
+        if m is not None:
+            break
+    else:
+        raise ValueError("%r is not in a valid HTTP date format" % date)
+    try:
+        tz = datetime.timezone.utc
+        year = int(m["year"])
+        if year < 100:
+            current_year = datetime.datetime.now(tz=tz).year
+            current_century = current_year - (current_year % 100)
+            if year - (current_year % 100) > 50:
+                # year that appears to be more than 50 years in the future are
+                # interpreted as representing the past.
+                year += current_century - 100
+            else:
+                year += current_century
+        month = MONTHS.index(m["mon"].lower()) + 1
+        day = int(m["day"])
+        hour = int(m["hour"])
+        min = int(m["min"])
+        sec = int(m["sec"])
+        result = datetime.datetime(year, month, day, hour, min, sec, tzinfo=tz)
+        return int(result.timestamp())
+    except Exception as exc:
+        raise ValueError("%r is not a valid date" % date) from exc
 
 
-def filepath_to_uri(path):
-    """Convert a file system path to a URI portion that is suitable for
-    inclusion in a URL.
-
-    Encode certain chars that would normally be recognized as special chars
-    for URIs. Do not encode the ' character, as it is a valid character
-    within URIs. See the encodeURIComponent() JavaScript function for details.
+def parse_http_date_safe(date):
     """
-    if path is None:
-        return path
-    # I know about `os.sep` and `os.altsep` but I want to leave
-    # some flexibility for hardcoding separators.
-    return quote(str(path).replace("\\", "/"), safe="/~!*()'")
-
-
-def get_system_encoding():
-    """
-    The encoding for the character type functions. Fallback to 'ascii' if the
-    #encoding is unsupported by Python or could not be determined. See tickets
-    #10335 and #5846.
+    Same as parse_http_date, but return None if the input is invalid.
     """
     try:
-        encoding = locale.getlocale()[1] or "ascii"
-        codecs.lookup(encoding)
+        return parse_http_date(date)
     except Exception:
-        encoding = "ascii"
-    return encoding
+        pass
 
 
-DEFAULT_LOCALE_ENCODING = get_system_encoding()
+# Base 36 functions: useful for generating compact URLs
+
+
+def base36_to_int(s):
+    """
+    Convert a base 36 string to an int. Raise ValueError if the input won't fit
+    into an int.
+    """
+    # To prevent overconsumption of server resources, reject any
+    # base36 string that is longer than 13 base36 digits (13 digits
+    # is sufficient to base36-encode any 64-bit integer)
+    if len(s) > 13:
+        raise ValueError("Base36 input too large")
+    return int(s, 36)
+
+
+def int_to_base36(i):
+    """Convert an integer to a base36 string."""
+    char_set = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if i < 0:
+        raise ValueError("Negative base36 conversion input.")
+    if i < 36:
+        return char_set[i]
+    b36 = ""
+    while i != 0:
+        i, n = divmod(i, 36)
+        b36 = char_set[n] + b36
+    return b36
+
+
+def urlsafe_base64_encode(s):
+    """
+    Encode a bytestring to a base64 string for use in URLs. Strip any trailing
+    equal signs.
+    """
+    return base64.urlsafe_b64encode(s).rstrip(b"\n=").decode("ascii")
+
+
+def urlsafe_base64_decode(s):
+    """
+    Decode a base64 encoded string. Add back any trailing equal signs that
+    might have been stripped.
+    """
+    s = s.encode()
+    try:
+        return base64.urlsafe_b64decode(s.ljust(len(s) + len(s) % 4, b"="))
+    except (LookupError, BinasciiError) as e:
+        raise ValueError(e)
+
+
+def parse_etags(etag_str):
+    """
+    Parse a string of ETags given in an If-None-Match or If-Match header as
+    defined by RFC 9110. Return a list of quoted ETags, or ['*'] if all ETags
+    should be matched.
+    """
+    if etag_str.strip() == "*":
+        return ["*"]
+    else:
+        # Parse each ETag individually, and return any that are valid.
+        etag_matches = (ETAG_MATCH.match(etag.strip()) for etag in etag_str.split(","))
+        return [match[1] for match in etag_matches if match]
+
+
+def quote_etag(etag_str):
+    """
+    If the provided string is already a quoted ETag, return it. Otherwise, wrap
+    the string in quotes, making it a strong ETag.
+    """
+    if ETAG_MATCH.match(etag_str):
+        return etag_str
+    else:
+        return '"%s"' % etag_str
+
+
+def is_same_domain(host, pattern):
+    """
+    Return ``True`` if the host is either an exact match or a match
+    to the wildcard pattern.
+
+    Any pattern beginning with a period matches a domain and all of its
+    subdomains. (e.g. ``.example.com`` matches ``example.com`` and
+    ``foo.example.com``). Anything else is an exact string match.
+    """
+    if not pattern:
+        return False
+
+    pattern = pattern.lower()
+    return (
+        pattern[0] == "."
+        and (host.endswith(pattern) or host == pattern[1:])
+        or pattern == host
+    )
+
+
+def url_has_allowed_host_and_scheme(url, allowed_hosts, require_https=False):
+    """
+    Return ``True`` if the url uses an allowed host and a safe scheme.
+
+    Always return ``False`` on an empty url.
+
+    If ``require_https`` is ``True``, only 'https' will be considered a valid
+    scheme, as opposed to 'http' and 'https' with the default, ``False``.
+
+    Note: "True" doesn't entail that a URL is "safe". It may still be e.g.
+    quoted incorrectly. Ensure to also use django.utils.encoding.iri_to_uri()
+    on the path component of untrusted URLs.
+    """
+    if url is not None:
+        url = url.strip()
+    if not url:
+        return False
+    if allowed_hosts is None:
+        allowed_hosts = set()
+    elif isinstance(allowed_hosts, str):
+        allowed_hosts = {allowed_hosts}
+    # Chrome treats \ completely as / in paths but it could be part of some
+    # basic auth credentials so we need to check both URLs.
+    return _url_has_allowed_host_and_scheme(
+        url, allowed_hosts, require_https=require_https
+    ) and _url_has_allowed_host_and_scheme(
+        url.replace("\\", "/"), allowed_hosts, require_https=require_https
+    )
+
+
+def _url_has_allowed_host_and_scheme(url, allowed_hosts, require_https=False):
+    # Chrome considers any URL with more than two slashes to be absolute, but
+    # urlparse is not so flexible. Treat any url with three slashes as unsafe.
+    if url.startswith("///"):
+        return False
+    try:
+        url_info = urlparse(url)
+    except ValueError:  # e.g. invalid IPv6 addresses
+        return False
+    # Forbid URLs like http:///example.com - with a scheme, but without a hostname.
+    # In that URL, example.com is not the hostname but, a path component. However,
+    # Chrome will still consider example.com to be the hostname, so we must not
+    # allow this syntax.
+    if not url_info.netloc and url_info.scheme:
+        return False
+    # Forbid URLs that start with control characters. Some browsers (like
+    # Chrome) ignore quite a few control characters at the start of a
+    # URL and might consider the URL as scheme relative.
+    if unicodedata.category(url[0])[0] == "C":
+        return False
+    scheme = url_info.scheme
+    # Consider URLs without a scheme (e.g. //example.com/p) to be http.
+    if not url_info.scheme and url_info.netloc:
+        scheme = "http"
+    valid_schemes = ["https"] if require_https else ["http", "https"]
+    return (not url_info.netloc or url_info.netloc in allowed_hosts) and (
+        not scheme or scheme in valid_schemes
+    )
+
+
+def escape_leading_slashes(url):
+    """
+    If redirecting to an absolute path (two leading slashes), a slash must be
+    escaped to prevent browsers from handling the path as schemaless and
+    redirecting to another host.
+    """
+    if url.startswith("//"):
+        url = "/%2F{}".format(url.removeprefix("//"))
+    return url
+
+
+def _parseparam(s):
+    while s[:1] == ";":
+        s = s[1:]
+        end = s.find(";")
+        while end > 0 and (s.count('"', 0, end) - s.count('\\"', 0, end)) % 2:
+            end = s.find(";", end + 1)
+        if end < 0:
+            end = len(s)
+        f = s[:end]
+        yield f.strip()
+        s = s[end:]
+
+
+def parse_header_parameters(line):
+    """
+    Parse a Content-type like header.
+    Return the main content-type and a dictionary of options.
+    """
+    parts = _parseparam(";" + line)
+    key = parts.__next__().lower()
+    pdict = {}
+    for p in parts:
+        i = p.find("=")
+        if i >= 0:
+            has_encoding = False
+            name = p[:i].strip().lower()
+            if name.endswith("*"):
+                # Lang/encoding embedded in the value (like "filename*=UTF-8''file.ext")
+                # https://tools.ietf.org/html/rfc2231#section-4
+                name = name[:-1]
+                if p.count("'") == 2:
+                    has_encoding = True
+            value = p[i + 1 :].strip()
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
+                value = value.replace("\\\\", "\\").replace('\\"', '"')
+            if has_encoding:
+                encoding, lang, value = value.split("'")
+                value = unquote(value, encoding=encoding)
+            pdict[name] = value
+    return key, pdict
+
+
+def content_disposition_header(as_attachment, filename):
+    """
+    Construct a Content-Disposition HTTP header value from the given filename
+    as specified by RFC 6266.
+    """
+    if filename:
+        disposition = "attachment" if as_attachment else "inline"
+        try:
+            filename.encode("ascii")
+            file_expr = 'filename="{}"'.format(
+                filename.replace("\\", "\\\\").replace('"', r"\"")
+            )
+        except UnicodeEncodeError:
+            file_expr = "filename*=utf-8''{}".format(quote(filename))
+        return f"{disposition}; {file_expr}"
+    elif as_attachment:
+        return "attachment"
+    else:
+        return None

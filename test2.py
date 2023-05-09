@@ -1,626 +1,676 @@
-from __future__ import annotations
-
+import itertools
+import logging
 import os
-import typing as t
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import weakref
 from collections import defaultdict
-from functools import update_wrapper
+from functools import lru_cache, wraps
+from pathlib import Path
+from types import ModuleType
+from zipimport import zipimporter
 
-from . import typing as ft
-from .scaffold import _endpoint_from_view_func
-from .scaffold import _sentinel
-from .scaffold import Scaffold
-from .scaffold import setupmethod
+import django
+from django.apps import apps
+from django.core.signals import request_finished
+from django.dispatch import Signal
+from django.utils.functional import cached_property
+from django.utils.version import get_version_tuple
 
-if t.TYPE_CHECKING:  # pragma: no cover
-    from .app import Flask
+autoreload_started = Signal()
+file_changed = Signal()
 
-DeferredSetupFunction = t.Callable[["BlueprintSetupState"], t.Callable]
-T_after_request = t.TypeVar("T_after_request", bound=ft.AfterRequestCallable)
-T_before_request = t.TypeVar("T_before_request", bound=ft.BeforeRequestCallable)
-T_error_handler = t.TypeVar("T_error_handler", bound=ft.ErrorHandlerCallable)
-T_teardown = t.TypeVar("T_teardown", bound=ft.TeardownCallable)
-T_template_context_processor = t.TypeVar(
-    "T_template_context_processor", bound=ft.TemplateContextProcessorCallable
-)
-T_template_filter = t.TypeVar("T_template_filter", bound=ft.TemplateFilterCallable)
-T_template_global = t.TypeVar("T_template_global", bound=ft.TemplateGlobalCallable)
-T_template_test = t.TypeVar("T_template_test", bound=ft.TemplateTestCallable)
-T_url_defaults = t.TypeVar("T_url_defaults", bound=ft.URLDefaultCallable)
-T_url_value_preprocessor = t.TypeVar(
-    "T_url_value_preprocessor", bound=ft.URLValuePreprocessorCallable
-)
+DJANGO_AUTORELOAD_ENV = "RUN_MAIN"
+
+logger = logging.getLogger("django.utils.autoreload")
+
+# If an error is raised while importing a file, it's not placed in sys.modules.
+# This means that any future modifications aren't caught. Keep a list of these
+# file paths to allow watching them in the future.
+_error_files = []
+_exception = None
+
+try:
+    import termios
+except ImportError:
+    termios = None
 
 
-class BlueprintSetupState:
-    """Temporary holder object for registering a blueprint with the
-    application.  An instance of this class is created by the
-    :meth:`~flask.Blueprint.make_setup_state` method and later passed
-    to all register callback functions.
-    """
+try:
+    import pywatchman
+except ImportError:
+    pywatchman = None
 
-    def __init__(
-        self,
-        blueprint: Blueprint,
-        app: Flask,
-        options: t.Any,
-        first_registration: bool,
-    ) -> None:
-        #: a reference to the current application
-        self.app = app
 
-        #: a reference to the blueprint that created this setup state.
-        self.blueprint = blueprint
+def is_django_module(module):
+    """Return True if the given module is nested under Django."""
+    return module.__name__.startswith("django.")
 
-        #: a dictionary with all options that were passed to the
-        #: :meth:`~flask.Flask.register_blueprint` method.
-        self.options = options
 
-        #: as blueprints can be registered multiple times with the
-        #: application and not everything wants to be registered
-        #: multiple times on it, this attribute can be used to figure
-        #: out if the blueprint was registered in the past already.
-        self.first_registration = first_registration
+def is_django_path(path):
+    """Return True if the given file path is nested under Django."""
+    return Path(django.__file__).parent in Path(path).parents
 
-        subdomain = self.options.get("subdomain")
-        if subdomain is None:
-            subdomain = self.blueprint.subdomain
 
-        #: The subdomain that the blueprint should be active for, ``None``
-        #: otherwise.
-        self.subdomain = subdomain
+def check_errors(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _exception
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            _exception = sys.exc_info()
 
-        url_prefix = self.options.get("url_prefix")
-        if url_prefix is None:
-            url_prefix = self.blueprint.url_prefix
-        #: The prefix that should be used for all URLs defined on the
-        #: blueprint.
-        self.url_prefix = url_prefix
+            et, ev, tb = _exception
 
-        self.name = self.options.get("name", blueprint.name)
-        self.name_prefix = self.options.get("name_prefix", "")
-
-        #: A dictionary with URL defaults that is added to each and every
-        #: URL that was defined with the blueprint.
-        self.url_defaults = dict(self.blueprint.url_values_defaults)
-        self.url_defaults.update(self.options.get("url_defaults", ()))
-
-    def add_url_rule(
-        self,
-        rule: str,
-        endpoint: str | None = None,
-        view_func: t.Callable | None = None,
-        **options: t.Any,
-    ) -> None:
-        """A helper method to register a rule (and optionally a view function)
-        to the application.  The endpoint is automatically prefixed with the
-        blueprint's name.
-        """
-        if self.url_prefix is not None:
-            if rule:
-                rule = "/".join((self.url_prefix.rstrip("/"), rule.lstrip("/")))
+            if getattr(ev, "filename", None) is None:
+                # get the filename from the last item in the stack
+                filename = traceback.extract_tb(tb)[-1][0]
             else:
-                rule = self.url_prefix
-        options.setdefault("subdomain", self.subdomain)
-        if endpoint is None:
-            endpoint = _endpoint_from_view_func(view_func)  # type: ignore
-        defaults = self.url_defaults
-        if "defaults" in options:
-            defaults = dict(defaults, **options.pop("defaults"))
+                filename = ev.filename
 
-        self.app.add_url_rule(
-            rule,
-            f"{self.name_prefix}.{self.name}.{endpoint}".lstrip("."),
-            view_func,
-            defaults=defaults,
-            **options,
-        )
+            if filename not in _error_files:
+                _error_files.append(filename)
+
+            raise
+
+    return wrapper
 
 
-class Blueprint(Scaffold):
-    """Represents a blueprint, a collection of routes and other
-    app-related functions that can be registered on a real application
-    later.
+def raise_last_exception():
+    global _exception
+    if _exception is not None:
+        raise _exception[1]
 
-    A blueprint is an object that allows defining application functions
-    without requiring an application object ahead of time. It uses the
-    same decorators as :class:`~flask.Flask`, but defers the need for an
-    application by recording them for later registration.
 
-    Decorating a function with a blueprint creates a deferred function
-    that is called with :class:`~flask.blueprints.BlueprintSetupState`
-    when the blueprint is registered on an application.
-
-    See :doc:`/blueprints` for more information.
-
-    :param name: The name of the blueprint. Will be prepended to each
-        endpoint name.
-    :param import_name: The name of the blueprint package, usually
-        ``__name__``. This helps locate the ``root_path`` for the
-        blueprint.
-    :param static_folder: A folder with static files that should be
-        served by the blueprint's static route. The path is relative to
-        the blueprint's root path. Blueprint static files are disabled
-        by default.
-    :param static_url_path: The url to serve static files from.
-        Defaults to ``static_folder``. If the blueprint does not have
-        a ``url_prefix``, the app's static route will take precedence,
-        and the blueprint's static files won't be accessible.
-    :param template_folder: A folder with templates that should be added
-        to the app's template search path. The path is relative to the
-        blueprint's root path. Blueprint templates are disabled by
-        default. Blueprint templates have a lower precedence than those
-        in the app's templates folder.
-    :param url_prefix: A path to prepend to all of the blueprint's URLs,
-        to make them distinct from the rest of the app's routes.
-    :param subdomain: A subdomain that blueprint routes will match on by
-        default.
-    :param url_defaults: A dict of default values that blueprint routes
-        will receive by default.
-    :param root_path: By default, the blueprint will automatically set
-        this based on ``import_name``. In certain situations this
-        automatic detection can fail, so the path can be specified
-        manually instead.
-
-    .. versionchanged:: 1.1.0
-        Blueprints have a ``cli`` group to register nested CLI commands.
-        The ``cli_group`` parameter controls the name of the group under
-        the ``flask`` command.
-
-    .. versionadded:: 0.7
+def ensure_echo_on():
     """
+    Ensure that echo mode is enabled. Some tools such as PDB disable
+    it which causes usability issues after reload.
+    """
+    if not termios or not sys.stdin.isatty():
+        return
+    attr_list = termios.tcgetattr(sys.stdin)
+    if not attr_list[3] & termios.ECHO:
+        attr_list[3] |= termios.ECHO
+        if hasattr(signal, "SIGTTOU"):
+            old_handler = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        else:
+            old_handler = None
+        termios.tcsetattr(sys.stdin, termios.TCSANOW, attr_list)
+        if old_handler is not None:
+            signal.signal(signal.SIGTTOU, old_handler)
 
-    _got_registered_once = False
 
-    def __init__(
-        self,
-        name: str,
-        import_name: str,
-        static_folder: str | os.PathLike | None = None,
-        static_url_path: str | None = None,
-        template_folder: str | os.PathLike | None = None,
-        url_prefix: str | None = None,
-        subdomain: str | None = None,
-        url_defaults: dict | None = None,
-        root_path: str | None = None,
-        cli_group: str | None = _sentinel,  # type: ignore
-    ):
-        super().__init__(
-            import_name=import_name,
-            static_folder=static_folder,
-            static_url_path=static_url_path,
-            template_folder=template_folder,
-            root_path=root_path,
+def iter_all_python_module_files():
+    # This is a hot path during reloading. Create a stable sorted list of
+    # modules based on the module name and pass it to iter_modules_and_files().
+    # This ensures cached results are returned in the usual case that modules
+    # aren't loaded on the fly.
+    keys = sorted(sys.modules)
+    modules = tuple(
+        m
+        for m in map(sys.modules.__getitem__, keys)
+        if not isinstance(m, weakref.ProxyTypes)
+    )
+    return iter_modules_and_files(modules, frozenset(_error_files))
+
+
+@lru_cache(maxsize=1)
+def iter_modules_and_files(modules, extra_files):
+    """Iterate through all modules needed to be watched."""
+    sys_file_paths = []
+    for module in modules:
+        # During debugging (with PyDev) the 'typing.io' and 'typing.re' objects
+        # are added to sys.modules, however they are types not modules and so
+        # cause issues here.
+        if not isinstance(module, ModuleType):
+            continue
+        if module.__name__ in ("__main__", "__mp_main__"):
+            # __main__ (usually manage.py) doesn't always have a __spec__ set.
+            # Handle this by falling back to using __file__, resolved below.
+            # See https://docs.python.org/reference/import.html#main-spec
+            # __file__ may not exists, e.g. when running ipdb debugger.
+            if hasattr(module, "__file__"):
+                sys_file_paths.append(module.__file__)
+            continue
+        if getattr(module, "__spec__", None) is None:
+            continue
+        spec = module.__spec__
+        # Modules could be loaded from places without a concrete location. If
+        # this is the case, skip them.
+        if spec.has_location:
+            origin = (
+                spec.loader.archive
+                if isinstance(spec.loader, zipimporter)
+                else spec.origin
+            )
+            sys_file_paths.append(origin)
+
+    results = set()
+    for filename in itertools.chain(sys_file_paths, extra_files):
+        if not filename:
+            continue
+        path = Path(filename)
+        try:
+            if not path.exists():
+                # The module could have been removed, don't fail loudly if this
+                # is the case.
+                continue
+        except ValueError as e:
+            # Network filesystems may return null bytes in file paths.
+            logger.debug('"%s" raised when resolving path: "%s"', e, path)
+            continue
+        resolved_path = path.resolve().absolute()
+        results.add(resolved_path)
+    return frozenset(results)
+
+
+@lru_cache(maxsize=1)
+def common_roots(paths):
+    """
+    Return a tuple of common roots that are shared between the given paths.
+    File system watchers operate on directories and aren't cheap to create.
+    Try to find the minimum set of directories to watch that encompass all of
+    the files that need to be watched.
+    """
+    # Inspired from Werkzeug:
+    # https://github.com/pallets/werkzeug/blob/7477be2853df70a022d9613e765581b9411c3c39/werkzeug/_reloader.py
+    # Create a sorted list of the path components, longest first.
+    path_parts = sorted([x.parts for x in paths], key=len, reverse=True)
+    tree = {}
+    for chunks in path_parts:
+        node = tree
+        # Add each part of the path to the tree.
+        for chunk in chunks:
+            node = node.setdefault(chunk, {})
+        # Clear the last leaf in the tree.
+        node.clear()
+
+    # Turn the tree into a list of Path instances.
+    def _walk(node, path):
+        for prefix, child in node.items():
+            yield from _walk(child, path + (prefix,))
+        if not node:
+            yield Path(*path)
+
+    return tuple(_walk(tree, ()))
+
+
+def sys_path_directories():
+    """
+    Yield absolute directories from sys.path, ignoring entries that don't
+    exist.
+    """
+    for path in sys.path:
+        path = Path(path)
+        if not path.exists():
+            continue
+        resolved_path = path.resolve().absolute()
+        # If the path is a file (like a zip file), watch the parent directory.
+        if resolved_path.is_file():
+            yield resolved_path.parent
+        else:
+            yield resolved_path
+
+
+def get_child_arguments():
+    """
+    Return the executable. This contains a workaround for Windows if the
+    executable is reported to not have the .exe extension which can cause bugs
+    on reloading.
+    """
+    import __main__
+
+    py_script = Path(sys.argv[0])
+
+    args = [sys.executable] + ["-W%s" % o for o in sys.warnoptions]
+    if sys.implementation.name == "cpython":
+        args.extend(
+            f"-X{key}" if value is True else f"-X{key}={value}"
+            for key, value in sys._xoptions.items()
         )
+    # __spec__ is set when the server was started with the `-m` option,
+    # see https://docs.python.org/3/reference/import.html#main-spec
+    # __spec__ may not exist, e.g. when running in a Conda env.
+    if getattr(__main__, "__spec__", None) is not None:
+        spec = __main__.__spec__
+        if (spec.name == "__main__" or spec.name.endswith(".__main__")) and spec.parent:
+            name = spec.parent
+        else:
+            name = spec.name
+        args += ["-m", name]
+        args += sys.argv[1:]
+    elif not py_script.exists():
+        # sys.argv[0] may not exist for several reasons on Windows.
+        # It may exist with a .exe extension or have a -script.py suffix.
+        exe_entrypoint = py_script.with_suffix(".exe")
+        if exe_entrypoint.exists():
+            # Should be executed directly, ignoring sys.executable.
+            return [exe_entrypoint, *sys.argv[1:]]
+        script_entrypoint = py_script.with_name("%s-script.py" % py_script.name)
+        if script_entrypoint.exists():
+            # Should be executed as usual.
+            return [*args, script_entrypoint, *sys.argv[1:]]
+        raise RuntimeError("Script %s does not exist." % py_script)
+    else:
+        args += sys.argv
+    return args
 
-        if not name:
-            raise ValueError("'name' may not be empty.")
 
-        if "." in name:
-            raise ValueError("'name' may not contain a dot '.' character.")
+def trigger_reload(filename):
+    logger.info("%s changed, reloading.", filename)
+    sys.exit(3)
 
-        self.name = name
-        self.url_prefix = url_prefix
-        self.subdomain = subdomain
-        self.deferred_functions: list[DeferredSetupFunction] = []
 
-        if url_defaults is None:
-            url_defaults = {}
+def restart_with_reloader():
+    new_environ = {**os.environ, DJANGO_AUTORELOAD_ENV: "true"}
+    args = get_child_arguments()
+    while True:
+        p = subprocess.run(args, env=new_environ, close_fds=False)
+        if p.returncode != 3:
+            return p.returncode
 
-        self.url_values_defaults = url_defaults
-        self.cli_group = cli_group
-        self._blueprints: list[tuple[Blueprint, dict]] = []
 
-    def _check_setup_finished(self, f_name: str) -> None:
-        if self._got_registered_once:
-            raise AssertionError(
-                f"The setup method '{f_name}' can no longer be called on the blueprint"
-                f" '{self.name}'. It has already been registered at least once, any"
-                " changes will not be applied consistently.\n"
-                "Make sure all imports, decorators, functions, etc. needed to set up"
-                " the blueprint are done before registering it."
+class BaseReloader:
+    def __init__(self):
+        self.extra_files = set()
+        self.directory_globs = defaultdict(set)
+        self._stop_condition = threading.Event()
+
+    def watch_dir(self, path, glob):
+        path = Path(path)
+        try:
+            path = path.absolute()
+        except FileNotFoundError:
+            logger.debug(
+                "Unable to watch directory %s as it cannot be resolved.",
+                path,
+                exc_info=True,
             )
+            return
+        logger.debug("Watching dir %s with glob %s.", path, glob)
+        self.directory_globs[path].add(glob)
 
-    @setupmethod
-    def record(self, func: t.Callable) -> None:
-        """Registers a function that is called when the blueprint is
-        registered on the application.  This function is called with the
-        state as argument as returned by the :meth:`make_setup_state`
-        method.
+    def watched_files(self, include_globs=True):
         """
-        self.deferred_functions.append(func)
-
-    @setupmethod
-    def record_once(self, func: t.Callable) -> None:
-        """Works like :meth:`record` but wraps the function in another
-        function that will ensure the function is only called once.  If the
-        blueprint is registered a second time on the application, the
-        function passed is not called.
+        Yield all files that need to be watched, including module files and
+        files within globs.
         """
+        yield from iter_all_python_module_files()
+        yield from self.extra_files
+        if include_globs:
+            for directory, patterns in self.directory_globs.items():
+                for pattern in patterns:
+                    yield from directory.glob(pattern)
 
-        def wrapper(state: BlueprintSetupState) -> None:
-            if state.first_registration:
-                func(state)
-
-        self.record(update_wrapper(wrapper, func))
-
-    def make_setup_state(
-        self, app: Flask, options: dict, first_registration: bool = False
-    ) -> BlueprintSetupState:
-        """Creates an instance of :meth:`~flask.blueprints.BlueprintSetupState`
-        object that is later passed to the register callback functions.
-        Subclasses can override this to return a subclass of the setup state.
+    def wait_for_apps_ready(self, app_reg, django_main_thread):
         """
-        return BlueprintSetupState(self, app, options, first_registration)
+        Wait until Django reports that the apps have been loaded. If the given
+        thread has terminated before the apps are ready, then a SyntaxError or
+        other non-recoverable error has been raised. In that case, stop waiting
+        for the apps_ready event and continue processing.
 
-    @setupmethod
-    def register_blueprint(self, blueprint: Blueprint, **options: t.Any) -> None:
-        """Register a :class:`~flask.Blueprint` on this blueprint. Keyword
-        arguments passed to this method will override the defaults set
-        on the blueprint.
-
-        .. versionchanged:: 2.0.1
-            The ``name`` option can be used to change the (pre-dotted)
-            name the blueprint is registered with. This allows the same
-            blueprint to be registered multiple times with unique names
-            for ``url_for``.
-
-        .. versionadded:: 2.0
+        Return True if the thread is alive and the ready event has been
+        triggered, or False if the thread is terminated while waiting for the
+        event.
         """
-        if blueprint is self:
-            raise ValueError("Cannot register a blueprint on itself")
-        self._blueprints.append((blueprint, options))
+        while django_main_thread.is_alive():
+            if app_reg.ready_event.wait(timeout=0.1):
+                return True
+        else:
+            logger.debug("Main Django thread has terminated before apps are ready.")
+            return False
 
-    def register(self, app: Flask, options: dict) -> None:
-        """Called by :meth:`Flask.register_blueprint` to register all
-        views and callbacks registered on the blueprint with the
-        application. Creates a :class:`.BlueprintSetupState` and calls
-        each :meth:`record` callback with it.
+    def run(self, django_main_thread):
+        logger.debug("Waiting for apps ready_event.")
+        self.wait_for_apps_ready(apps, django_main_thread)
+        from django.urls import get_resolver
 
-        :param app: The application this blueprint is being registered
-            with.
-        :param options: Keyword arguments forwarded from
-            :meth:`~Flask.register_blueprint`.
+        # Prevent a race condition where URL modules aren't loaded when the
+        # reloader starts by accessing the urlconf_module property.
+        try:
+            get_resolver().urlconf_module
+        except Exception:
+            # Loading the urlconf can result in errors during development.
+            # If this occurs then swallow the error and continue.
+            pass
+        logger.debug("Apps ready_event triggered. Sending autoreload_started signal.")
+        autoreload_started.send(sender=self)
+        self.run_loop()
 
-        .. versionchanged:: 2.3
-            Nested blueprints now correctly apply subdomains.
+    def run_loop(self):
+        ticker = self.tick()
+        while not self.should_stop:
+            try:
+                next(ticker)
+            except StopIteration:
+                break
+        self.stop()
 
-        .. versionchanged:: 2.1
-            Registering the same blueprint with the same name multiple
-            times is an error.
-
-        .. versionchanged:: 2.0.1
-            Nested blueprints are registered with their dotted name.
-            This allows different blueprints with the same name to be
-            nested at different locations.
-
-        .. versionchanged:: 2.0.1
-            The ``name`` option can be used to change the (pre-dotted)
-            name the blueprint is registered with. This allows the same
-            blueprint to be registered multiple times with unique names
-            for ``url_for``.
+    def tick(self):
         """
-        name_prefix = options.get("name_prefix", "")
-        self_name = options.get("name", self.name)
-        name = f"{name_prefix}.{self_name}".lstrip(".")
+        This generator is called in a loop from run_loop. It's important that
+        the method takes care of pausing or otherwise waiting for a period of
+        time. This split between run_loop() and tick() is to improve the
+        testability of the reloader implementations by decoupling the work they
+        do from the loop.
+        """
+        raise NotImplementedError("subclasses must implement tick().")
 
-        if name in app.blueprints:
-            bp_desc = "this" if app.blueprints[name] is self else "a different"
-            existing_at = f" '{name}'" if self_name != name else ""
+    @classmethod
+    def check_availability(cls):
+        raise NotImplementedError("subclasses must implement check_availability().")
 
-            raise ValueError(
-                f"The name '{self_name}' is already registered for"
-                f" {bp_desc} blueprint{existing_at}. Use 'name=' to"
-                f" provide a unique name."
-            )
+    def notify_file_changed(self, path):
+        results = file_changed.send(sender=self, file_path=path)
+        logger.debug("%s notified as changed. Signal results: %s.", path, results)
+        if not any(res[1] for res in results):
+            trigger_reload(path)
 
-        first_bp_registration = not any(bp is self for bp in app.blueprints.values())
-        first_name_registration = name not in app.blueprints
+    # These are primarily used for testing.
+    @property
+    def should_stop(self):
+        return self._stop_condition.is_set()
 
-        app.blueprints[name] = self
-        self._got_registered_once = True
-        state = self.make_setup_state(app, options, first_bp_registration)
+    def stop(self):
+        self._stop_condition.set()
 
-        if self.has_static_folder:
-            state.add_url_rule(
-                f"{self.static_url_path}/<path:filename>",
-                view_func=self.send_static_file,
-                endpoint="static",
-            )
 
-        # Merge blueprint data into parent.
-        if first_bp_registration or first_name_registration:
+class StatReloader(BaseReloader):
+    SLEEP_TIME = 1  # Check for changes once per second.
 
-            def extend(bp_dict, parent_dict):
-                for key, values in bp_dict.items():
-                    key = name if key is None else f"{name}.{key}"
-                    parent_dict[key].extend(values)
+    def tick(self):
+        mtimes = {}
+        while True:
+            for filepath, mtime in self.snapshot_files():
+                old_time = mtimes.get(filepath)
+                mtimes[filepath] = mtime
+                if old_time is None:
+                    logger.debug("File %s first seen with mtime %s", filepath, mtime)
+                    continue
+                elif mtime > old_time:
+                    logger.debug(
+                        "File %s previous mtime: %s, current mtime: %s",
+                        filepath,
+                        old_time,
+                        mtime,
+                    )
+                    self.notify_file_changed(filepath)
 
-            for key, value in self.error_handler_spec.items():
-                key = name if key is None else f"{name}.{key}"
-                value = defaultdict(
-                    dict,
-                    {
-                        code: {
-                            exc_class: func for exc_class, func in code_values.items()
-                        }
-                        for code, code_values in value.items()
-                    },
+            time.sleep(self.SLEEP_TIME)
+            yield
+
+    def snapshot_files(self):
+        # watched_files may produce duplicate paths if globs overlap.
+        seen_files = set()
+        for file in self.watched_files():
+            if file in seen_files:
+                continue
+            try:
+                mtime = file.stat().st_mtime
+            except OSError:
+                # This is thrown when the file does not exist.
+                continue
+            seen_files.add(file)
+            yield file, mtime
+
+    @classmethod
+    def check_availability(cls):
+        return True
+
+
+class WatchmanUnavailable(RuntimeError):
+    pass
+
+
+class WatchmanReloader(BaseReloader):
+    def __init__(self):
+        self.roots = defaultdict(set)
+        self.processed_request = threading.Event()
+        self.client_timeout = int(os.environ.get("DJANGO_WATCHMAN_TIMEOUT", 5))
+        super().__init__()
+
+    @cached_property
+    def client(self):
+        return pywatchman.client(timeout=self.client_timeout)
+
+    def _watch_root(self, root):
+        # In practice this shouldn't occur, however, it's possible that a
+        # directory that doesn't exist yet is being watched. If it's outside of
+        # sys.path then this will end up a new root. How to handle this isn't
+        # clear: Not adding the root will likely break when subscribing to the
+        # changes, however, as this is currently an internal API,  no files
+        # will be being watched outside of sys.path. Fixing this by checking
+        # inside watch_glob() and watch_dir() is expensive, instead this could
+        # could fall back to the StatReloader if this case is detected? For
+        # now, watching its parent, if possible, is sufficient.
+        if not root.exists():
+            if not root.parent.exists():
+                logger.warning(
+                    "Unable to watch root dir %s as neither it or its parent exist.",
+                    root,
                 )
-                app.error_handler_spec[key] = value
+                return
+            root = root.parent
+        result = self.client.query("watch-project", str(root.absolute()))
+        if "warning" in result:
+            logger.warning("Watchman warning: %s", result["warning"])
+        logger.debug("Watchman watch-project result: %s", result)
+        return result["watch"], result.get("relative_path")
 
-            for endpoint, func in self.view_functions.items():
-                app.view_functions[endpoint] = func
+    @lru_cache
+    def _get_clock(self, root):
+        return self.client.query("clock", root)["clock"]
 
-            extend(self.before_request_funcs, app.before_request_funcs)
-            extend(self.after_request_funcs, app.after_request_funcs)
-            extend(
-                self.teardown_request_funcs,
-                app.teardown_request_funcs,
+    def _subscribe(self, directory, name, expression):
+        root, rel_path = self._watch_root(directory)
+        # Only receive notifications of files changing, filtering out other types
+        # like special files: https://facebook.github.io/watchman/docs/type
+        only_files_expression = [
+            "allof",
+            ["anyof", ["type", "f"], ["type", "l"]],
+            expression,
+        ]
+        query = {
+            "expression": only_files_expression,
+            "fields": ["name"],
+            "since": self._get_clock(root),
+            "dedup_results": True,
+        }
+        if rel_path:
+            query["relative_root"] = rel_path
+        logger.debug(
+            "Issuing watchman subscription %s, for root %s. Query: %s",
+            name,
+            root,
+            query,
+        )
+        self.client.query("subscribe", root, name, query)
+
+    def _subscribe_dir(self, directory, filenames):
+        if not directory.exists():
+            if not directory.parent.exists():
+                logger.warning(
+                    "Unable to watch directory %s as neither it or its parent exist.",
+                    directory,
+                )
+                return
+            prefix = "files-parent-%s" % directory.name
+            filenames = ["%s/%s" % (directory.name, filename) for filename in filenames]
+            directory = directory.parent
+            expression = ["name", filenames, "wholename"]
+        else:
+            prefix = "files"
+            expression = ["name", filenames]
+        self._subscribe(directory, "%s:%s" % (prefix, directory), expression)
+
+    def _watch_glob(self, directory, patterns):
+        """
+        Watch a directory with a specific glob. If the directory doesn't yet
+        exist, attempt to watch the parent directory and amend the patterns to
+        include this. It's important this method isn't called more than one per
+        directory when updating all subscriptions. Subsequent calls will
+        overwrite the named subscription, so it must include all possible glob
+        expressions.
+        """
+        prefix = "glob"
+        if not directory.exists():
+            if not directory.parent.exists():
+                logger.warning(
+                    "Unable to watch directory %s as neither it or its parent exist.",
+                    directory,
+                )
+                return
+            prefix = "glob-parent-%s" % directory.name
+            patterns = ["%s/%s" % (directory.name, pattern) for pattern in patterns]
+            directory = directory.parent
+
+        expression = ["anyof"]
+        for pattern in patterns:
+            expression.append(["match", pattern, "wholename"])
+        self._subscribe(directory, "%s:%s" % (prefix, directory), expression)
+
+    def watched_roots(self, watched_files):
+        extra_directories = self.directory_globs.keys()
+        watched_file_dirs = [f.parent for f in watched_files]
+        sys_paths = list(sys_path_directories())
+        return frozenset((*extra_directories, *watched_file_dirs, *sys_paths))
+
+    def _update_watches(self):
+        watched_files = list(self.watched_files(include_globs=False))
+        found_roots = common_roots(self.watched_roots(watched_files))
+        logger.debug("Watching %s files", len(watched_files))
+        logger.debug("Found common roots: %s", found_roots)
+        # Setup initial roots for performance, shortest roots first.
+        for root in sorted(found_roots):
+            self._watch_root(root)
+        for directory, patterns in self.directory_globs.items():
+            self._watch_glob(directory, patterns)
+        # Group sorted watched_files by their parent directory.
+        sorted_files = sorted(watched_files, key=lambda p: p.parent)
+        for directory, group in itertools.groupby(sorted_files, key=lambda p: p.parent):
+            # These paths need to be relative to the parent directory.
+            self._subscribe_dir(
+                directory, [str(p.relative_to(directory)) for p in group]
             )
-            extend(self.url_default_functions, app.url_default_functions)
-            extend(self.url_value_preprocessors, app.url_value_preprocessors)
-            extend(self.template_context_processors, app.template_context_processors)
 
-        for deferred in self.deferred_functions:
-            deferred(state)
+    def update_watches(self):
+        try:
+            self._update_watches()
+        except Exception as ex:
+            # If the service is still available, raise the original exception.
+            if self.check_server_status(ex):
+                raise
 
-        cli_resolved_group = options.get("cli_group", self.cli_group)
+    def _check_subscription(self, sub):
+        subscription = self.client.getSubscription(sub)
+        if not subscription:
+            return
+        logger.debug("Watchman subscription %s has results.", sub)
+        for result in subscription:
+            # When using watch-project, it's not simple to get the relative
+            # directory without storing some specific state. Store the full
+            # path to the directory in the subscription name, prefixed by its
+            # type (glob, files).
+            root_directory = Path(result["subscription"].split(":", 1)[1])
+            logger.debug("Found root directory %s", root_directory)
+            for file in result.get("files", []):
+                self.notify_file_changed(root_directory / file)
 
-        if self.cli.commands:
-            if cli_resolved_group is None:
-                app.cli.commands.update(self.cli.commands)
-            elif cli_resolved_group is _sentinel:
-                self.cli.name = name
-                app.cli.add_command(self.cli)
+    def request_processed(self, **kwargs):
+        logger.debug("Request processed. Setting update_watches event.")
+        self.processed_request.set()
+
+    def tick(self):
+        request_finished.connect(self.request_processed)
+        self.update_watches()
+        while True:
+            if self.processed_request.is_set():
+                self.update_watches()
+                self.processed_request.clear()
+            try:
+                self.client.receive()
+            except pywatchman.SocketTimeout:
+                pass
+            except pywatchman.WatchmanError as ex:
+                logger.debug("Watchman error: %s, checking server status.", ex)
+                self.check_server_status(ex)
             else:
-                self.cli.name = cli_resolved_group
-                app.cli.add_command(self.cli)
+                for sub in list(self.client.subs.keys()):
+                    self._check_subscription(sub)
+            yield
+            # Protect against busy loops.
+            time.sleep(0.1)
 
-        for blueprint, bp_options in self._blueprints:
-            bp_options = bp_options.copy()
-            bp_url_prefix = bp_options.get("url_prefix")
-            bp_subdomain = bp_options.get("subdomain")
+    def stop(self):
+        self.client.close()
+        super().stop()
 
-            if bp_subdomain is None:
-                bp_subdomain = blueprint.subdomain
+    def check_server_status(self, inner_ex=None):
+        """Return True if the server is available."""
+        try:
+            self.client.query("version")
+        except Exception:
+            raise WatchmanUnavailable(str(inner_ex)) from inner_ex
+        return True
 
-            if state.subdomain is not None and bp_subdomain is not None:
-                bp_options["subdomain"] = bp_subdomain + "." + state.subdomain
-            elif bp_subdomain is not None:
-                bp_options["subdomain"] = bp_subdomain
-            elif state.subdomain is not None:
-                bp_options["subdomain"] = state.subdomain
+    @classmethod
+    def check_availability(cls):
+        if not pywatchman:
+            raise WatchmanUnavailable("pywatchman not installed.")
+        client = pywatchman.client(timeout=0.1)
+        try:
+            result = client.capabilityCheck()
+        except Exception:
+            # The service is down?
+            raise WatchmanUnavailable("Cannot connect to the watchman service.")
+        version = get_version_tuple(result["version"])
+        # Watchman 4.9 includes multiple improvements to watching project
+        # directories as well as case insensitive filesystems.
+        logger.debug("Watchman version %s", version)
+        if version < (4, 9):
+            raise WatchmanUnavailable("Watchman 4.9 or later is required.")
 
-            if bp_url_prefix is None:
-                bp_url_prefix = blueprint.url_prefix
 
-            if state.url_prefix is not None and bp_url_prefix is not None:
-                bp_options["url_prefix"] = (
-                    state.url_prefix.rstrip("/") + "/" + bp_url_prefix.lstrip("/")
-                )
-            elif bp_url_prefix is not None:
-                bp_options["url_prefix"] = bp_url_prefix
-            elif state.url_prefix is not None:
-                bp_options["url_prefix"] = state.url_prefix
+def get_reloader():
+    """Return the most suitable reloader for this environment."""
+    try:
+        WatchmanReloader.check_availability()
+    except WatchmanUnavailable:
+        return StatReloader()
+    return WatchmanReloader()
 
-            bp_options["name_prefix"] = name
-            blueprint.register(app, bp_options)
 
-    @setupmethod
-    def add_url_rule(
-        self,
-        rule: str,
-        endpoint: str | None = None,
-        view_func: ft.RouteCallable | None = None,
-        provide_automatic_options: bool | None = None,
-        **options: t.Any,
-    ) -> None:
-        """Register a URL rule with the blueprint. See :meth:`.Flask.add_url_rule` for
-        full documentation.
+def start_django(reloader, main_func, *args, **kwargs):
+    ensure_echo_on()
 
-        The URL rule is prefixed with the blueprint's URL prefix. The endpoint name,
-        used with :func:`url_for`, is prefixed with the blueprint's name.
-        """
-        if endpoint and "." in endpoint:
-            raise ValueError("'endpoint' may not contain a dot '.' character.")
+    main_func = check_errors(main_func)
+    django_main_thread = threading.Thread(
+        target=main_func, args=args, kwargs=kwargs, name="django-main-thread"
+    )
+    django_main_thread.daemon = True
+    django_main_thread.start()
 
-        if view_func and hasattr(view_func, "__name__") and "." in view_func.__name__:
-            raise ValueError("'view_func' name may not contain a dot '.' character.")
+    while not reloader.should_stop:
+        reloader.run(django_main_thread)
 
-        self.record(
-            lambda s: s.add_url_rule(
-                rule,
-                endpoint,
-                view_func,
-                provide_automatic_options=provide_automatic_options,
-                **options,
+
+def run_with_reloader(main_func, *args, **kwargs):
+    signal.signal(signal.SIGTERM, lambda *args: sys.exit(0))
+    try:
+        if os.environ.get(DJANGO_AUTORELOAD_ENV) == "true":
+            reloader = get_reloader()
+            logger.info(
+                "Watching for file changes with %s", reloader.__class__.__name__
             )
-        )
-
-    @setupmethod
-    def app_template_filter(
-        self, name: str | None = None
-    ) -> t.Callable[[T_template_filter], T_template_filter]:
-        """Register a template filter, available in any template rendered by the
-        application. Equivalent to :meth:`.Flask.template_filter`.
-
-        :param name: the optional name of the filter, otherwise the
-                     function name will be used.
-        """
-
-        def decorator(f: T_template_filter) -> T_template_filter:
-            self.add_app_template_filter(f, name=name)
-            return f
-
-        return decorator
-
-    @setupmethod
-    def add_app_template_filter(
-        self, f: ft.TemplateFilterCallable, name: str | None = None
-    ) -> None:
-        """Register a template filter, available in any template rendered by the
-        application. Works like the :meth:`app_template_filter` decorator. Equivalent to
-        :meth:`.Flask.add_template_filter`.
-
-        :param name: the optional name of the filter, otherwise the
-                     function name will be used.
-        """
-
-        def register_template(state: BlueprintSetupState) -> None:
-            state.app.jinja_env.filters[name or f.__name__] = f
-
-        self.record_once(register_template)
-
-    @setupmethod
-    def app_template_test(
-        self, name: str | None = None
-    ) -> t.Callable[[T_template_test], T_template_test]:
-        """Register a template test, available in any template rendered by the
-        application. Equivalent to :meth:`.Flask.template_test`.
-
-        .. versionadded:: 0.10
-
-        :param name: the optional name of the test, otherwise the
-                     function name will be used.
-        """
-
-        def decorator(f: T_template_test) -> T_template_test:
-            self.add_app_template_test(f, name=name)
-            return f
-
-        return decorator
-
-    @setupmethod
-    def add_app_template_test(
-        self, f: ft.TemplateTestCallable, name: str | None = None
-    ) -> None:
-        """Register a template test, available in any template rendered by the
-        application. Works like the :meth:`app_template_test` decorator. Equivalent to
-        :meth:`.Flask.add_template_test`.
-
-        .. versionadded:: 0.10
-
-        :param name: the optional name of the test, otherwise the
-                     function name will be used.
-        """
-
-        def register_template(state: BlueprintSetupState) -> None:
-            state.app.jinja_env.tests[name or f.__name__] = f
-
-        self.record_once(register_template)
-
-    @setupmethod
-    def app_template_global(
-        self, name: str | None = None
-    ) -> t.Callable[[T_template_global], T_template_global]:
-        """Register a template global, available in any template rendered by the
-        application. Equivalent to :meth:`.Flask.template_global`.
-
-        .. versionadded:: 0.10
-
-        :param name: the optional name of the global, otherwise the
-                     function name will be used.
-        """
-
-        def decorator(f: T_template_global) -> T_template_global:
-            self.add_app_template_global(f, name=name)
-            return f
-
-        return decorator
-
-    @setupmethod
-    def add_app_template_global(
-        self, f: ft.TemplateGlobalCallable, name: str | None = None
-    ) -> None:
-        """Register a template global, available in any template rendered by the
-        application. Works like the :meth:`app_template_global` decorator. Equivalent to
-        :meth:`.Flask.add_template_global`.
-
-        .. versionadded:: 0.10
-
-        :param name: the optional name of the global, otherwise the
-                     function name will be used.
-        """
-
-        def register_template(state: BlueprintSetupState) -> None:
-            state.app.jinja_env.globals[name or f.__name__] = f
-
-        self.record_once(register_template)
-
-    @setupmethod
-    def before_app_request(self, f: T_before_request) -> T_before_request:
-        """Like :meth:`before_request`, but before every request, not only those handled
-        by the blueprint. Equivalent to :meth:`.Flask.before_request`.
-        """
-        self.record_once(
-            lambda s: s.app.before_request_funcs.setdefault(None, []).append(f)
-        )
-        return f
-
-    @setupmethod
-    def after_app_request(self, f: T_after_request) -> T_after_request:
-        """Like :meth:`after_request`, but after every request, not only those handled
-        by the blueprint. Equivalent to :meth:`.Flask.after_request`.
-        """
-        self.record_once(
-            lambda s: s.app.after_request_funcs.setdefault(None, []).append(f)
-        )
-        return f
-
-    @setupmethod
-    def teardown_app_request(self, f: T_teardown) -> T_teardown:
-        """Like :meth:`teardown_request`, but after every request, not only those
-        handled by the blueprint. Equivalent to :meth:`.Flask.teardown_request`.
-        """
-        self.record_once(
-            lambda s: s.app.teardown_request_funcs.setdefault(None, []).append(f)
-        )
-        return f
-
-    @setupmethod
-    def app_context_processor(
-        self, f: T_template_context_processor
-    ) -> T_template_context_processor:
-        """Like :meth:`context_processor`, but for templates rendered by every view, not
-        only by the blueprint. Equivalent to :meth:`.Flask.context_processor`.
-        """
-        self.record_once(
-            lambda s: s.app.template_context_processors.setdefault(None, []).append(f)
-        )
-        return f
-
-    @setupmethod
-    def app_errorhandler(
-        self, code: type[Exception] | int
-    ) -> t.Callable[[T_error_handler], T_error_handler]:
-        """Like :meth:`errorhandler`, but for every request, not only those handled by
-        the blueprint. Equivalent to :meth:`.Flask.errorhandler`.
-        """
-
-        def decorator(f: T_error_handler) -> T_error_handler:
-            self.record_once(lambda s: s.app.errorhandler(code)(f))
-            return f
-
-        return decorator
-
-    @setupmethod
-    def app_url_value_preprocessor(
-        self, f: T_url_value_preprocessor
-    ) -> T_url_value_preprocessor:
-        """Like :meth:`url_value_preprocessor`, but for every request, not only those
-        handled by the blueprint. Equivalent to :meth:`.Flask.url_value_preprocessor`.
-        """
-        self.record_once(
-            lambda s: s.app.url_value_preprocessors.setdefault(None, []).append(f)
-        )
-        return f
-
-    @setupmethod
-    def app_url_defaults(self, f: T_url_defaults) -> T_url_defaults:
-        """Like :meth:`url_defaults`, but for every request, not only those handled by
-        the blueprint. Equivalent to :meth:`.Flask.url_defaults`.
-        """
-        self.record_once(
-            lambda s: s.app.url_default_functions.setdefault(None, []).append(f)
-        )
-        return f
+            start_django(reloader, main_func, *args, **kwargs)
+        else:
+            exit_code = restart_with_reloader()
+            sys.exit(exit_code)
+    except KeyboardInterrupt:
+        pass

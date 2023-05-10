@@ -1,1 +1,1 @@
-FROM alpine
+FROM node:16-bullseye

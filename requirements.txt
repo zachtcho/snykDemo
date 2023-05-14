@@ -1,2 +1,2 @@
 req
-bleach==3.0.0
+bleach==3.1.4
